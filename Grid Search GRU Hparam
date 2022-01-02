@@ -1,0 +1,90 @@
+import tensorflow as tf
+import datetime
+from keras.layers import GRU, Dense,Dropout
+from sklearn.model_selection import train_test_split
+import numpy as np,pandas as pd
+from sklearn.preprocessing import MinMaxScaler
+from tensorboard.plugins.hparams import api as hp
+from keras.models import Sequential
+df = pd.read_csv('2015-2021 BitcoindatePrice.csv',sep=';', parse_dates=['date'],index_col=0)
+scaler=MinMaxScaler()   
+df['ScaledPrice'] =scaler.fit_transform( df[['price']])                
+df['Prediction']=df['ScaledPrice'].shift(-1)
+df=df[:-1]
+X = np.array(df['ScaledPrice'])
+y = np.array(df['Prediction'])
+X_train, x_test, y_train, y_test=  train_test_split(X, y, test_size=0.2,shuffle=False)
+X_train = np.reshape(X_train, (X_train.shape[0], 1, 1))
+x_test = np.reshape(x_test, (x_test.shape[0], 1, 1))
+epochs=10
+HP_NUM_UNITS=hp.HParam('num_units', hp.Discrete([ 32, 64]))
+HP_DROPOUT=hp.HParam('dropout', hp.RealInterval(0.1, 0.2))
+HP_LEARNING_RATE= hp.HParam('learning_rate', hp.Discrete([0.1, 0.05, 0.001]))
+HP_OPTIMIZER=hp.HParam('optimizer', hp.Discrete(['adam', 'sgd', 'rmsprop']))
+HP_ACTIVATION=hp.HParam('activation', hp.Discrete(['tanh', 'softmax','relu']))
+METRIC_MSE = 'mean_squared_error'
+log_dir = "logs/fit/" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+#!rm -rf ./logs/ 
+writer = tf.summary.create_file_writer(log_dir)
+
+with writer.as_default():   
+    hp.hparams_config(
+        hparams=[HP_NUM_UNITS, HP_ACTIVATION, HP_DROPOUT,  HP_OPTIMIZER, HP_LEARNING_RATE],
+        metrics=[hp.Metric(METRIC_MSE, display_name='MSE')]
+    )                  
+def create_model(hparams):
+    activation=hparams[HP_ACTIVATION]
+    if activation=='tanh':
+        activation=tf.nn.tanh
+    elif activation=='softmax':
+        activation=tf.nn.softmax
+    elif activation=='relu':
+        activation=tf.nn.relu
+    else:
+        raise ValueError("unexpected activation name: %r" % (activation))   
+    model = Sequential([GRU(hparams[HP_NUM_UNITS], return_sequences=True,input_shape=(1, 1),activation=activation),
+    Dropout(hparams[HP_DROPOUT]),
+    GRU(hparams[HP_NUM_UNITS], return_sequences=False),
+    Dense(1)])          
+    optimizer  = hparams[HP_OPTIMIZER]
+    learning_rate = hparams[HP_LEARNING_RATE]
+    if optimizer == "adam":
+        optimizer = tf.optimizers.Adam(learning_rate=learning_rate)
+    elif optimizer == "sgd":
+        optimizer = tf.optimizers.SGD(learning_rate=learning_rate)
+    elif optimizer=='rmsprop':
+        optimizer = tf.optimizers.RMSprop(learning_rate=learning_rate)
+    else:
+        raise ValueError("unexpected optimizer name: %r" % (optimizer))
+    model.compile(optimizer=optimizer,
+              loss='mean_squared_error',
+              metrics=['mse'])
+    model.fit(X_train,y_train,batch_size=1,               
+    epochs=epochs,validation_data=(x_test, y_test),
+    callbacks=[tf.keras.callbacks.TensorBoard(log_dir),hp.KerasCallback(log_dir, hparams)])
+    _,loss=model.evaluate(x_test, y_test)
+    return loss
+   
+def run(run_dir, hparams):
+  with tf.summary.create_file_writer(run_dir).as_default():
+    hp.hparams(hparams)  # record the values used in this trial
+    METRIC_RMSE = create_model(hparams)
+    tf.summary.scalar( 'mean_squared_error',METRIC_RMSE,step=2)
+session_num = 0
+for num_units in HP_NUM_UNITS.domain.values:
+  for dropout_rate in (HP_DROPOUT.domain.min_value, HP_DROPOUT.domain.max_value):
+    for activation in HP_ACTIVATION.domain.values:
+      for optimizer in HP_OPTIMIZER.domain.values:
+        for learning_rate in HP_LEARNING_RATE.domain.values:
+          hparams = {
+              HP_NUM_UNITS: num_units,
+              HP_DROPOUT: dropout_rate,
+              HP_ACTIVATION:activation,
+              HP_OPTIMIZER: optimizer,
+              HP_LEARNING_RATE: learning_rate,
+          }
+          run_name = "run-%d" % session_num
+          print('--- Starting trial: %s' % run_name)
+          print({h.name: hparams[h] for h in hparams})
+          run('logs/hparam_tuning/' + run_name, hparams)
+          session_num += 1
